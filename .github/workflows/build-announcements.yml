@@ -1,26 +1,54 @@
 name: Build announcements.json
 
 on:
-  push:
-    paths:
-      - 'announcements/*.md'
+  repository_dispatch:
+    types: [build-announcements]
   workflow_dispatch:
+    inputs:
+      branch:
+        description: Target branch
+        required: true
+        type: choice
+        options:
+          - stable
+          - testing
+          - unstable
 
 permissions:
   contents: write
+
+concurrency:
+  group: build-announcements-${{ github.event.client_payload.branch || github.event.inputs.branch }}
+  cancel-in-progress: false
 
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
+      - name: Resolve target branch
+        id: target
+        env:
+          DISPATCH_BRANCH: ${{ github.event.client_payload.branch }}
+          INPUT_BRANCH: ${{ github.event.inputs.branch }}
+        run: |
+          BRANCH="${DISPATCH_BRANCH:-$INPUT_BRANCH}"
+          case "$BRANCH" in
+            stable|testing|unstable) ;;
+            *) echo "::error::invalid or missing branch: '$BRANCH'"; exit 1 ;;
+          esac
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          ref: ${{ steps.target.outputs.branch }}
 
       - name: Build announcements.json
         run: python3 .github/scripts/build-announcements.py
         env:
-          TZ: Asia/Shanghai
+          RELEASE_BRANCH: ${{ steps.target.outputs.branch }}
+          SOURCE_REPO: ublue-os/bazzite
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TZ: UTC
 
       - name: Commit if changed
         run: |

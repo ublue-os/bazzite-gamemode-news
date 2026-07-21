@@ -1,49 +1,105 @@
 #!/usr/bin/env python3
-"""
-Parse announcements/*.md and generate announcements.json + docs/index.html.
-Keeps the latest N entries sorted by date descending.
-"""
 
-import glob
 import html
 import json
 import os
 import re
-import sys
-from datetime import datetime
+import urllib.request
+from datetime import datetime, timezone
 
 MAX_ENTRIES = 20
 ROOT_DIR = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", ".."))
-ANNOUNCEMENTS_DIR = os.path.join(ROOT_DIR, "announcements")
 OUTPUT_FILE = os.path.join(ROOT_DIR, "announcements.json")
 DOCS_DIR = os.path.join(ROOT_DIR, "docs")
 HTML_FILE = os.path.join(DOCS_DIR, "index.html")
 
+SOURCE_REPO = os.environ.get("SOURCE_REPO", "ublue-os/bazzite")
 
-def parse_front_matter(text):
-    """Parse --- delimited front matter and body from a markdown file."""
-    lines = text.split("\n")
-    if not lines or lines[0].strip() != "---":
-        return {}, text
+# branch -> (prerelease_filter, channel)
+BRANCH_CONFIG = {
+    "stable": (False, "rel"),
+    "testing": (True, "beta"),
+    "unstable": (True, "preview"),
+}
 
-    end = -1
-    for i in range(1, len(lines)):
-        if lines[i].strip() == "---":
-            end = i
+
+def branch_config(branch):
+    """Return (prerelease, channel) for a git branch, or raise ValueError."""
+    if branch not in BRANCH_CONFIG:
+        raise ValueError(f"unknown branch: {branch!r} (expected one of {sorted(BRANCH_CONFIG)})")
+    return BRANCH_CONFIG[branch]
+
+
+def select_releases(releases, prerelease, limit=MAX_ENTRIES):
+    """Filter releases by prerelease flag, drop drafts, sort newest-first, cap at limit."""
+    kept = [
+        r for r in releases
+        if bool(r.get("prerelease")) == prerelease and not r.get("draft")
+    ]
+    kept.sort(key=lambda r: r.get("published_at") or "", reverse=True)
+    return kept[:limit]
+
+
+KEEP_SECTIONS = {"Major packages", "Commits"}
+
+
+def extract_sections(body):
+    """Keep only allowlisted '### <heading>' sections from a release body."""
+    lines = (body or "").split("\n")
+    result = []
+    keeping = False
+    for line in lines:
+        m = re.match(r"^#{1,6}\s+(.*)", line.strip())
+        if m:
+            keeping = m.group(1).strip() in KEEP_SECTIONS
+        if keeping:
+            result.append(line)
+    return "\n".join(result).strip()
+
+
+def normalize_release_date(published_at):
+    """Parse GitHub ISO-8601 UTC timestamp into (display_str, unix_ts)."""
+    dt = datetime.strptime(published_at, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    return dt.strftime("%Y-%m-%d %H:%M"), int(dt.timestamp())
+
+
+def release_to_entry(release, channel):
+    """Convert a GitHub release dict into an announcement entry."""
+    body = extract_sections(release.get("body", ""))
+    date_str, timestamp = normalize_release_date(release["published_at"])
+    return {
+        "title": release.get("name") or "",
+        "date": date_str,
+        "timestamp": timestamp,
+        "channel": channel,
+        "lang": "english",
+        "body": body,
+        "bbcode_body": md_to_bbcode(body),
+        "html_body": md_to_html(body),
+    }
+
+
+def fetch_releases(repo, token, urlopen=None):
+    """Fetch all releases for a repo (paginated), newest first. stdlib only."""
+    opener = urlopen or urllib.request.urlopen
+    results = []
+    page = 1
+    while True:
+        url = f"https://api.github.com/repos/{repo}/releases?per_page=100&page={page}"
+        req = urllib.request.Request(url)
+        req.add_header("Accept", "application/vnd.github+json")
+        req.add_header("User-Agent", "bazzite-gamemode-news")
+        if token:
+            req.add_header("Authorization", f"Bearer {token}")
+        with opener(req, timeout=30) as resp:
+            batch = json.loads(resp.read().decode("utf-8"))
+        if not batch:
             break
-    if end < 0:
-        return {}, text
-
-    meta = {}
-    for line in lines[1:end]:
-        line = line.strip()
-        if not line or ":" not in line:
-            continue
-        key, _, val = line.partition(":")
-        meta[key.strip()] = val.strip()
-
-    body = "\n".join(lines[end + 1:]).strip()
-    return meta, body
+        results.extend(batch)
+        if len(batch) < 100:
+            break
+        page += 1
+    return results
 
 
 def _is_table_row(line):
@@ -332,72 +388,21 @@ def md_to_html(text):
     return text
 
 
-def git_commit_time(filepath):
-    """Return the last git commit datetime for a file, or None."""
-    import subprocess
-    try:
-        ts = subprocess.check_output(
-            ["git", "log", "-1", "--format=%ct", "--", filepath],
-            stderr=subprocess.DEVNULL,
-        ).decode().strip()
-        if ts:
-            return datetime.fromtimestamp(int(ts))
-    except Exception:
-        pass
-    return None
-
-
-def normalize_date(raw, filepath=None):
-    """Fill missing/partial date and return (datetime_str, unix_timestamp).
-    No date → git commit time of the file → current time as last resort."""
-    if not raw:
-        dt = (filepath and git_commit_time(filepath)) or datetime.now()
-    elif re.match(r"^\d{4}-\d{2}-\d{2}$", raw):
-        dt = datetime.strptime(raw, "%Y-%m-%d")
-    elif re.match(r"^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}$", raw):
-        dt = datetime.strptime(raw, "%Y-%m-%d %H:%M")
-    elif re.match(r"^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}$", raw):
-        dt = datetime.strptime(raw, "%Y-%m-%d %H:%M:%S")
-    else:
-        dt = (filepath and git_commit_time(filepath)) or datetime.now()
-    return dt.strftime("%Y-%m-%d %H:%M"), int(dt.timestamp())
-
-
 def main():
-    md_dir = os.path.normpath(ANNOUNCEMENTS_DIR)
+    branch = os.environ.get("RELEASE_BRANCH", "").strip()
+    prerelease, channel = branch_config(branch)
+    token = os.environ.get("GITHUB_TOKEN") or None
+
+    releases = fetch_releases(SOURCE_REPO, token)
+    selected = select_releases(releases, prerelease, MAX_ENTRIES)
+    entries = [release_to_entry(r, channel) for r in selected]
+
     out_file = os.path.normpath(OUTPUT_FILE)
-
-    pattern = os.path.join(md_dir, "*.md")
-    files = sorted(glob.glob(pattern))
-
-    entries = []
-    for fpath in files:
-        with open(fpath, "r", encoding="utf-8") as f:
-            text = f.read()
-        meta, body = parse_front_matter(text)
-        if not meta.get("title"):
-            print(f"SKIP (no title): {fpath}", file=sys.stderr)
-            continue
-        date_str, timestamp = normalize_date(meta.get("date", ""), fpath)
-        entries.append({
-            "title": meta.get("title", ""),
-            "date": date_str,
-            "timestamp": timestamp,
-            "channel": meta.get("channel", ""),
-            "lang": meta.get("lang", ""),
-            "body": body,
-            "bbcode_body": md_to_bbcode(body),
-            "html_body": md_to_html(body),
-        })
-
-    entries.sort(key=lambda e: e["timestamp"], reverse=True)
-    entries = entries[:MAX_ENTRIES]
-
     with open(out_file, "w", encoding="utf-8") as f:
         json.dump(entries, f, ensure_ascii=False, indent=2)
         f.write("\n")
-
-    print(f"Generated {out_file}: {len(entries)} entries from {len(files)} files")
+    print(f"Generated {out_file}: {len(entries)} entries "
+          f"from {len(releases)} releases (branch={branch}, channel={channel})")
 
     generate_html(entries)
     print(f"Generated {HTML_FILE}")
